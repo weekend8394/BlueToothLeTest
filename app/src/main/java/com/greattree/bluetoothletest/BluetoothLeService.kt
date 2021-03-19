@@ -7,8 +7,10 @@ import android.bluetooth.*
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Binder
 import android.os.Build
@@ -16,14 +18,17 @@ import android.os.IBinder
 import android.util.Log
 import com.greattree.bluetoothletest.KotlinBlueUtil.byteArrayToHexStr
 import com.greattree.bluetoothletest.KotlinBlueUtil.getBENEMeasure
-import kotlinx.coroutines.GlobalScope
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
 import java.util.*
 
-class BluetoothLeService : Service() {
+class BluetoothLeService : Service() , CoroutineScope by MainScope() {
     companion object {
         private val TAG = BluetoothLeService::class.java.canonicalName
+        const val PERMISSION_CODE = 8686
+        const val ACTION_GATT_CONNECTED = "com.example.bluetooth.le.ACTION_GATT_CONNECTED"
+        const val ACTION_GATT_DISCONNECTED = "com.example.bluetooth.le.ACTION_GATT_DISCONNECTED"
+        const val ACTION_GATT_SERVICES_DISCOVERED = "com.example.bluetooth.le.ACTION_GATT_SERVICES_DISCOVERED"
+        const val EXTRA_DATA = "com.example.bluetooth.le.EXTRA_DATA"
     }
 
     private val binder = LocalBinder()
@@ -34,8 +39,10 @@ class BluetoothLeService : Service() {
     private var mBluetoothGatt: BluetoothGatt? = null
     private var mContext: Context? = null
     private var sendValue: ByteArray? = null
-    private var mDevice:BluetoothDevice? = null
+    private var mDevice: BluetoothDevice? = null
     private var beneCounter = 0
+    private var needPing = false
+    private var connectJob : Job?= null
 
     private val leScanCallback: ScanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
@@ -61,6 +68,11 @@ class BluetoothLeService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? {
         return binder
+    }
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        disconnectGatt()
+        return super.onUnbind(intent)
     }
 
     inner class LocalBinder : Binder() {
@@ -104,7 +116,7 @@ class BluetoothLeService : Service() {
     fun hasPermission(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             if (mContext?.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-                (mContext as Activity).requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), 123)
+                (mContext as Activity).requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), PERMISSION_CODE)
                 false
             } else {
                 true
@@ -134,36 +146,50 @@ class BluetoothLeService : Service() {
         mBluetoothLeScanner?.stopScan(leScanCallback)
     }
 
-    fun disconnectGatt(){
+    fun disconnectGatt() {
         mBluetoothGatt?.disconnect()
         mBluetoothGatt?.close()
         mBluetoothGatt = null
     }
 
-    fun reConnectGatt(){
+    fun reConnectGatt() {
         connectDeviceGATT(mDevice)
     }
 
-    override fun onUnbind(intent: Intent?): Boolean {
-        disconnectGatt()
-        return super.onUnbind(intent)
+    private val broadCastReceiver: BroadcastReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val action = intent.action
+            if (BluetoothDevice.ACTION_PAIRING_REQUEST == action) {
+                needPing = true
+                Log.e(TAG, "pin entered and request sent...")
+            }
+        }
     }
 
     private fun connectDeviceGATT(device: BluetoothDevice?) {
+        val intentFilter = IntentFilter(BluetoothDevice.ACTION_PAIRING_REQUEST)
+        intentFilter.priority = IntentFilter.SYSTEM_HIGH_PRIORITY
+        mContext?.registerReceiver(broadCastReceiver, intentFilter)
+
         mBluetoothGatt = device?.connectGatt(mContext, false, object : BluetoothGattCallback() {
             /**
              * 連線狀態
              * */
             override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
                 super.onConnectionStateChange(gatt, status, newState)
+                val intentAction: String
                 when (newState) {
                     BluetoothProfile.STATE_CONNECTED -> {
                         Log.i(TAG, "onConnectionStateChange : 已連線")
                         Log.i(TAG, "Attempting to start service discovery: " + gatt?.discoverServices())
+                        intentAction = ACTION_GATT_CONNECTED
+                        broadcastUpdate(intentAction)
                     }
 
                     BluetoothProfile.STATE_DISCONNECTED -> {
                         Log.i(TAG, "onConnectionStateChange : 失去連線")
+                        intentAction = ACTION_GATT_DISCONNECTED
+                        broadcastUpdate(intentAction)
                     }
                 }
             }
@@ -176,12 +202,15 @@ class BluetoothLeService : Service() {
                 Log.i(TAG, "onServicesDiscovered : 發現服務")
                 when (status) {
                     BluetoothGatt.GATT_SUCCESS -> {
+                        broadcastUpdate(ACTION_GATT_SERVICES_DISCOVERED)
+
                         var isEnableNotification = false
 
                         gatt?.services?.forEach { service ->
                             if (isEnableNotification) {
                                 return@forEach
                             }
+
                             Log.i(
                                 TAG,
                                 "-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- \n" +
@@ -212,6 +241,10 @@ class BluetoothLeService : Service() {
                             }
                         }
                     }
+
+                    BluetoothGatt.GATT_FAILURE -> {
+
+                    }
                 }
             }
 
@@ -219,7 +252,6 @@ class BluetoothLeService : Service() {
                 var success = false
                 mBluetoothGatt?.setCharacteristicNotification(characteristic, true)?.run {
                     Log.d(TAG, "setCharacteristicNotification: $this")
-                    Thread.sleep(1000)
                     success = this
                     if (success) {
                         Log.d(
@@ -237,7 +269,6 @@ class BluetoothLeService : Service() {
                                     descriptor.value = BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
                                     Log.d(TAG, "enableNotification PROPERTY_INDICATE}")
                                 }
-                                descriptor.value = byteArrayOf(0x01, 0x06)
                                 mBluetoothGatt?.writeDescriptor(descriptor)
                             }
                         }
@@ -256,6 +287,27 @@ class BluetoothLeService : Service() {
                 Log.d(TAG, "onDescriptorWrite: $status")
                 if (KotlinBlueUtil.isCharacteristicWritable(descriptor.characteristic)) {
                     writeCustomCharacteristic(descriptor.characteristic)
+                }else if (needPing){
+                    needPing = false
+                    connectJob?.cancel()
+                    connectJob = launch {
+                        mBluetoothGatt?.getService(UUID.fromString("00001808-0000-1000-8000-00805f9b34fb"))?.run {
+                            this.characteristics.forEach { characteristic ->
+                                Log.d(TAG, "characteristic.uuid: ${characteristic.uuid}")
+                                characteristic?.also { c ->
+                                    if (KotlinBlueUtil.isCharacteristicNotifiable(characteristic) || KotlinBlueUtil.isCharacteristicIndicate(characteristic)) {
+                                        Log.e(TAG, "characteristicUUID: ${c.uuid}")
+                                        Log.e(TAG, "isWritable : ${KotlinBlueUtil.isCharacteristicWritable(characteristic)}")
+                                        Log.e(TAG, "isReadable : ${KotlinBlueUtil.isCharacteristicReadable(characteristic)}")
+                                        Log.e(TAG, "isNotifiable : ${KotlinBlueUtil.isCharacteristicNotifiable(characteristic)}")
+                                        Log.e(TAG, "isIndicate : ${KotlinBlueUtil.isCharacteristicIndicate(characteristic)}")
+                                        delay(1000)
+                                        enableNotification(characteristic)
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -287,15 +339,18 @@ class BluetoothLeService : Service() {
                         val value = byteArrayToHexStr(characteristic?.value, "roche")
                         val rocheData = RocheData(byteArrayToHexStr(characteristic?.value, "date"), value!!, type!!)
                         Log.i(TAG, "onCharacteristicChanged: $rocheData  type : $type   unit : $unit")
+                        broadcastUpdate(EXTRA_DATA)
+
                     }
 
                     //杏倉
                     device.name.contains("BeneCheck") -> {
                         beneCounter++
-                        if(beneCounter <=1){
+                        if (beneCounter <= 1) {
                             val beneValue = getBENEMeasure(byteArrayToHexStr(characteristic?.value, "bene") ?: "", unit ?: "", type)
                             Log.i(TAG, "onCharacteristicChanged: $beneValue  type : $type   unit : $unit")
                             disconnectGatt()
+                            broadcastUpdate(EXTRA_DATA)
                         }
                     }
 
@@ -326,5 +381,10 @@ class BluetoothLeService : Service() {
                 }
             }
         })
+    }
+
+    private fun broadcastUpdate(action: String) {
+        val intent = Intent(action)
+        mContext?.sendBroadcast(intent)
     }
 }
